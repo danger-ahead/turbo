@@ -3,6 +3,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use itertools::Itertools;
 use rayon::prelude::*;
 use serde::Serialize;
 use thiserror::Error;
@@ -73,6 +74,14 @@ impl PackageInputsHashes {
         tracing::trace!(scm_manual=%scm.is_manual(), "scm running in {} mode", if scm.is_manual() { "manual" } else { "git" });
 
         let span = Span::current();
+        // pre-calculate some state to avoid re-computing it for each task
+        let package_paths = workspaces
+            .values()
+            .map(|workspace| workspace.package_path())
+            .sorted()
+            .collect::<Vec<_>>();
+        let cached_package_file_hashes =
+            scm.prepare_cached_package_file_hasher(repo_root, &package_paths)?;
 
         let (hashes, expanded_hashes): (HashMap<_, _>, HashMap<_, _>) = all_tasks
             .filter_map(|task| {
@@ -105,7 +114,7 @@ impl PackageInputsHashes {
                     .parent()
                     .unwrap_or_else(|| AnchoredSystemPath::new("").unwrap());
 
-                let mut hash_object = match scm.get_package_file_hashes(
+                let mut hash_object = match cached_package_file_hashes.get_package_file_hashes(
                     repo_root,
                     package_path,
                     &task_definition.inputs,

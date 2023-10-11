@@ -1,12 +1,150 @@
 use std::collections::HashMap;
 
 use itertools::{Either, Itertools};
-use tracing::debug;
+use tracing::{debug, warn};
 use turbopath::{AbsoluteSystemPath, AnchoredSystemPath, PathError, RelativeUnixPathBuf};
 
 use crate::{hash_object::hash_objects, Error, Git, SCM};
 
 pub type GitHashes = HashMap<RelativeUnixPathBuf, String>;
+
+/// Precalculates workspace data where it makes sense to reduce overhead from
+/// lazily calculating it on demand.
+pub enum CachedPackageFileHasher<'a> {
+    Manual,
+    Git(GitCachedPackageFileHasher<'a>),
+}
+
+impl<'a> CachedPackageFileHasher<'a> {
+    /// When creating a new CachedPackageFileHasher with the git hashes, we
+    /// precalculate and store a datastructure that maps package paths to
+    /// hashes of the files in that package, and a list of files that
+    /// changed. This saves having to call out to git for each package.
+    pub fn new(
+        scm: &'a SCM,
+        repo_root: &AbsoluteSystemPath,
+        package_roots: &[&'a AnchoredSystemPath],
+    ) -> Self {
+        match scm {
+            SCM::Git(git) => {
+                let mut map: HashMap<&AnchoredSystemPath, (GitHashes, Vec<_>)> = Default::default();
+
+                let mut hashes = git.git_ls_tree(repo_root).unwrap();
+
+                // Note: to_hash is *git repo relative*
+                let to_hash = git
+                    .append_git_status(repo_root, &Default::default(), &mut hashes)
+                    .unwrap();
+
+                let mut hashed_paths = hashes.into_iter().sorted_by(|(a, _), (b, _)| a.cmp(b));
+                let hashed_paths = hashed_paths.by_ref();
+
+                let mut files = to_hash.into_iter().sorted();
+                let files = files.by_ref();
+
+                for prefix in package_roots {
+                    let unix_prefix = prefix.to_unix();
+                    let unix_prefix = unix_prefix.as_str();
+
+                    // for each, discard while the prefix fails, then take while the prefix matches
+                    let hashes_for_prefix = hashed_paths
+                        .skip_while(|(path, _)| !path.starts_with(unix_prefix))
+                        .take_while(|(path, _)| path.starts_with(unix_prefix));
+
+                    let files_for_prefix = files
+                        .skip_while(|path| !path.starts_with(unix_prefix))
+                        .take_while(|path| path.starts_with(unix_prefix));
+
+                    let (hashes, files) = map.entry(prefix).or_default();
+
+                    hashes.extend(hashes_for_prefix);
+                    files.extend(files_for_prefix);
+                }
+
+                Self::Git(GitCachedPackageFileHasher { git, map })
+            }
+            SCM::Manual => Self::Manual,
+        }
+    }
+
+    pub fn get_package_file_hashes<S: AsRef<str>>(
+        &self,
+        turbo_root: &AbsoluteSystemPath,
+        package_path: &AnchoredSystemPath,
+        inputs: &[S],
+    ) -> Result<GitHashes, Error> {
+        match self {
+            CachedPackageFileHasher::Manual => {
+                crate::manual::get_package_file_hashes_from_processing_gitignore(
+                    turbo_root,
+                    package_path,
+                    inputs,
+                )
+            }
+            CachedPackageFileHasher::Git(git) => {
+                git.get_package_file_hashes(turbo_root, package_path, inputs)
+            }
+        }
+    }
+}
+
+pub struct GitCachedPackageFileHasher<'a> {
+    git: &'a Git,
+
+    /// A map of package paths to hashes of the files in that package, and a
+    /// list of files that changed
+    map: HashMap<&'a AnchoredSystemPath, (GitHashes, Vec<RelativeUnixPathBuf>)>,
+}
+
+impl<'a> GitCachedPackageFileHasher<'a> {
+    fn get_package_file_hashes<S: AsRef<str>>(
+        &self,
+        turbo_root: &AbsoluteSystemPath,
+        package_path: &'a AnchoredSystemPath,
+        inputs: &[S],
+    ) -> Result<GitHashes, Error> {
+        if inputs.is_empty() {
+            // cached branch
+            self.get_hashes_for_path(turbo_root, package_path)
+        } else {
+            self.git
+                .get_package_file_hashes_from_inputs(turbo_root, package_path, inputs)
+        }
+    }
+
+    fn get_hashes_for_path(
+        &self,
+        turbo_root: &AbsoluteSystemPath,
+
+        package_path: &AnchoredSystemPath,
+    ) -> Result<GitHashes, Error> {
+        // if in the cache, use it, otherwise fall back
+        let Some((hashes, files)) = self.map.get(package_path) else {
+            warn!("git cache miss for package path {:?}", package_path);
+            return self
+                .git
+                .get_package_file_hashes_from_index(turbo_root, package_path);
+        };
+
+        let mut hashes = hashes.clone();
+        let to_hash = files.iter().map(|f| f.as_ref()).collect::<Vec<_>>();
+        hash_objects(
+            &self.git.root,
+            &self.git.root.resolve(package_path),
+            &to_hash,
+            &mut hashes,
+        )?;
+
+        debug_assert!({
+            let expected = self
+                .git
+                .get_package_file_hashes_from_index(turbo_root, package_path);
+            expected.is_ok() && expected.unwrap() == hashes
+        });
+
+        Ok(hashes)
+    }
+}
 
 impl SCM {
     pub fn get_hashes_for_files(
@@ -49,6 +187,19 @@ impl SCM {
                     )
                 }),
         }
+    }
+
+    /// Prepare a cached package hasher.
+    ///
+    /// note: package_roots must be sorted alphabetically
+    #[tracing::instrument(skip(package_roots))]
+    pub fn prepare_cached_package_file_hasher<'a>(
+        &'a self,
+        repo_root: &AbsoluteSystemPath,
+        package_roots: &[&'a AnchoredSystemPath],
+    ) -> Result<CachedPackageFileHasher<'a>, Error> {
+        debug_assert!(package_roots.windows(2).all(|w| w[0] < w[1]));
+        Ok(CachedPackageFileHasher::new(self, repo_root, package_roots))
     }
 
     pub fn hash_files(
@@ -100,7 +251,7 @@ impl Git {
         let mut hashes = self.git_ls_tree(&full_pkg_path)?;
         // Note: to_hash is *git repo relative*
         let to_hash = self.append_git_status(&full_pkg_path, &pkg_prefix, &mut hashes)?;
-        hash_objects(&self.root, &full_pkg_path, to_hash, &mut hashes)?;
+        hash_objects(&self.root, &full_pkg_path, &to_hash, &mut hashes)?;
         Ok(hashes)
     }
 
@@ -119,7 +270,7 @@ impl Git {
             })
             .collect::<Result<Vec<_>, PathError>>()?;
         // Note: to_hash is *git repo relative*
-        hash_objects(&self.root, process_relative_to, to_hash, &mut hashes)?;
+        hash_objects(&self.root, process_relative_to, &to_hash, &mut hashes)?;
         Ok(hashes)
     }
 
@@ -182,7 +333,7 @@ impl Git {
             })
             .collect::<Result<Vec<_>, Error>>()?;
         let mut hashes = GitHashes::new();
-        hash_objects(&self.root, &full_pkg_path, to_hash, &mut hashes)?;
+        hash_objects(&self.root, &full_pkg_path, &to_hash, &mut hashes)?;
         Ok(hashes)
     }
 }
@@ -242,7 +393,7 @@ mod tests {
         let mut hashes = GitHashes::new();
         // FIXME: This test verifies a bug: we don't hash symlinks.
         // TODO: update this test to point at get_package_file_hashes
-        hash_objects(&git_root, &git_root, to_hash, &mut hashes).unwrap();
+        hash_objects(&git_root, &git_root, &to_hash, &mut hashes).unwrap();
         assert!(hashes.is_empty());
 
         let pkg_path = git_root.anchor(&git_root).unwrap();

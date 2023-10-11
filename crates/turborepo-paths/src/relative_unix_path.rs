@@ -77,6 +77,10 @@ impl RelativeUnixPath {
         self.0.ends_with(suffix.as_ref())
     }
 
+    pub fn starts_with(&self, prefix: impl AsRef<str>) -> bool {
+        self.0.starts_with(prefix.as_ref())
+    }
+
     pub fn extension(&self) -> Option<&str> {
         Utf8Path::new(&self.0).extension()
     }
