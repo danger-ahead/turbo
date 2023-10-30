@@ -18,7 +18,7 @@ use url::Url;
 
 pub use crate::error::{Error, Result};
 
-mod analytics;
+pub mod analytics;
 mod error;
 mod retry;
 pub mod spaces;

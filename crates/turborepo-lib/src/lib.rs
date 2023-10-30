@@ -9,6 +9,7 @@
 #![allow(clippy::needless_pass_by_ref_mut)]
 #![allow(dead_code)]
 
+mod analytics;
 mod child;
 mod cli;
 mod commands;
