@@ -30,12 +30,15 @@ enum Error {
 
 struct AnalyticsRecorder {
     tx: mpsc::Sender<AnalyticsEvent>,
-    cancel_tx: oneshot::Sender<()>,
+    cancel_rx: oneshot::Receiver<()>,
     handle: JoinHandle<()>,
 }
 
 impl AnalyticsRecorder {
-    pub fn new(api_auth: APIAuth, client: impl AnalyticsClient + Send + Sync) -> Self {
+    pub fn new(
+        api_auth: APIAuth,
+        client: impl AnalyticsClient + Clone + Send + Sync + 'static,
+    ) -> Self {
         let (tx, rx) = mpsc::channel(CHANNEL_SIZE);
         let (cancel_tx, cancel_rx) = oneshot::channel();
         let session_id = Uuid::new_v4();
@@ -44,21 +47,20 @@ impl AnalyticsRecorder {
             buffer: Vec::new(),
             session_id,
             api_auth,
-            cancel_rx,
+            cancel: cancel_tx,
             client,
         };
         let handle = worker.start();
 
         Self {
             tx,
-            cancel_tx,
+            cancel_rx,
             handle,
         }
     }
 
     async fn close(self) -> Result<(), Error> {
-        // If we fail to send, the worker has already been canceled.
-        let _ = self.cancel_tx.send(());
+        drop(self.cancel_rx);
         self.handle.await?;
 
         Ok(())
@@ -80,13 +82,13 @@ struct Worker<R> {
     buffer: Vec<AnalyticsEvent>,
     session_id: Uuid,
     api_auth: APIAuth,
-    cancel_rx: oneshot::Receiver<()>,
+    cancel: oneshot::Sender<()>,
     client: R,
 }
 
-impl<R: AnalyticsClient + Send + Sync> Worker<R> {
+impl<R: AnalyticsClient + Clone + Send + Sync + 'static> Worker<R> {
     pub fn start(mut self) -> JoinHandle<()> {
-        tokio::spawn(async {
+        tokio::spawn(async move {
             let mut timeout = tokio::time::sleep(NO_TIMEOUT);
             loop {
                 select! {
@@ -105,7 +107,7 @@ impl<R: AnalyticsClient + Send + Sync> Worker<R> {
                         self.flush();
                         timeout = tokio::time::sleep(NO_TIMEOUT);
                     }
-                    _ = self.cancel_rx => {
+                    _ = self.cancel.closed() => {
                         self.flush();
                         return;
                     }
@@ -122,20 +124,19 @@ impl<R: AnalyticsClient + Send + Sync> Worker<R> {
 
     fn send_events(&self, mut events: Vec<AnalyticsEvent>) {
         let session_id = self.session_id.clone();
-        tokio::spawn(async {
+        let client = self.client.clone();
+        let api_auth = self.api_auth.clone();
+        tokio::spawn(async move {
             add_session_id(session_id, &mut events);
             // We don't log an error for a timeout because
             // that's what the Go code does.
-            if let Err(err) = tokio::time::timeout(
-                REQUEST_TIMEOUT,
-                self.client.record_analytics(&self.api_auth, events),
-            )
-            .await?
+            if let Err(err) =
+                tokio::time::timeout(REQUEST_TIMEOUT, client.record_analytics(&api_auth, events))
+                    .await
+                    .unwrap()
             {
                 debug!("failed to record cache usage analytics. error: {}", err)
             }
-
-            Ok(())
         });
     }
 }
